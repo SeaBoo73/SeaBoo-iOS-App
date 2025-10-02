@@ -1,0 +1,946 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import Stripe from "stripe";
+import { registerOwnerRoutes } from "./routes/owner-registration";
+import { registerAnalyticsRoutes } from "./routes/analytics";
+import { registerEmergencyRoutes } from "./routes/emergencies";
+import { registerFeatureRoutes } from "./routes/features";
+import { registerAvailabilityRoutes } from "./routes/availability-management";
+import emergencyRoutes from "./routes/emergency";
+import externalRoutes from "./routes/external";
+import { Server as SocketIOServer } from "socket.io";
+import { aiService } from "./ai-service";
+import { storage } from "./storage";
+import { setupAuth } from "./auth";
+import { insertBoatSchema, insertBookingSchema, insertReviewSchema, insertMessageSchema } from "@shared/schema";
+import { z } from "zod";
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error('Missing required Stripe secret: STRIPE_SECRET_KEY');
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2024-06-20",
+});
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Register owner routes
+  registerOwnerRoutes(app);
+  
+  // Register advanced feature routes
+  registerAnalyticsRoutes(app);
+  registerEmergencyRoutes(app);
+  registerFeatureRoutes(app);
+  registerAvailabilityRoutes(app);
+  
+  // Emergency system routes
+  app.use('/api/emergency', emergencyRoutes);
+  
+  // External services routes
+  app.use('/api/external', externalRoutes);
+  
+  // Review routes
+  const { registerReviewRoutes } = await import("./routes/reviews");
+  registerReviewRoutes(app);
+  
+  // Messaging routes
+  const { registerMessagingRoutes } = await import("./routes/messaging");
+  registerMessagingRoutes(app);
+  
+  // Document management routes
+  const { registerDocumentRoutes } = await import("./routes/document-management");
+  registerDocumentRoutes(app);
+  
+  // Setup authentication
+  setupAuth(app);
+
+  // Configuration endpoint
+  app.get("/api/config", (req, res) => {
+    res.json({
+      googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY
+    });
+  });
+
+  // Boats endpoints
+  app.get("/api/boats", async (req, res) => {
+    try {
+      const { type, location, startDate, endDate, maxPersons, skipperRequired, fuelIncluded, ownerId } = req.query;
+      
+      const filters = {
+        type: type as string,
+        location: location as string,
+        startDate: startDate ? new Date(startDate as string) : undefined,
+        endDate: endDate ? new Date(endDate as string) : undefined,
+        maxPersons: maxPersons ? parseInt(maxPersons as string) : undefined,
+        skipperRequired: skipperRequired === 'true',
+        fuelIncluded: fuelIncluded === 'true',
+        ownerId: ownerId ? parseInt(ownerId as string) : undefined,
+      };
+
+      const boats = await storage.getBoats(filters);
+      res.json(boats);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching boats" });
+    }
+  });
+
+  app.get("/api/boats/:id", async (req, res) => {
+    try {
+      const boat = await storage.getBoat(parseInt(req.params.id));
+      if (!boat) {
+        return res.status(404).json({ message: "Boat not found" });
+      }
+      res.json(boat);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching boat" });
+    }
+  });
+
+  app.post("/api/boats", async (req, res) => {
+    if (!req.isAuthenticated() || (req.user.role !== "owner" && req.user.role !== "admin")) {
+      return res.sendStatus(403);
+    }
+
+    try {
+      const validation = insertBoatSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({ message: "Invalid boat data" });
+      }
+
+      const boat = await storage.createBoat({
+        ...validation.data,
+        ownerId: req.user.id,
+      });
+
+      res.status(201).json(boat);
+    } catch (error) {
+      res.status(500).json({ message: "Error creating boat" });
+    }
+  });
+
+  app.put("/api/boats/:id", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const boatId = parseInt(req.params.id);
+      const boat = await storage.getBoat(boatId);
+      
+      if (!boat) {
+        return res.status(404).json({ message: "Boat not found" });
+      }
+
+      if (boat.ownerId !== req.user.id && req.user.role !== "admin") {
+        return res.sendStatus(403);
+      }
+
+      const updatedBoat = await storage.updateBoat(boatId, req.body);
+      res.json(updatedBoat);
+    } catch (error) {
+      res.status(500).json({ message: "Error updating boat" });
+    }
+  });
+
+  app.delete("/api/boats/:id", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const boatId = parseInt(req.params.id);
+      const boat = await storage.getBoat(boatId);
+      
+      if (!boat) {
+        return res.status(404).json({ message: "Boat not found" });
+      }
+
+      if (boat.ownerId !== req.user.id && req.user.role !== "admin") {
+        return res.sendStatus(403);
+      }
+
+      await storage.deleteBoat(boatId);
+      res.sendStatus(204);
+    } catch (error) {
+      res.status(500).json({ message: "Error deleting boat" });
+    }
+  });
+
+  // Bookings endpoints
+  app.get("/api/bookings", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { customerId, boatId, ownerId, status } = req.query;
+      
+      const filters = {
+        customerId: customerId ? parseInt(customerId as string) : undefined,
+        boatId: boatId ? parseInt(boatId as string) : undefined,
+        ownerId: ownerId ? parseInt(ownerId as string) : undefined,
+        status: status as string,
+      };
+
+      const bookings = await storage.getBookings(filters);
+      res.json(bookings);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching bookings" });
+    }
+  });
+
+  app.get("/api/bookings/:id", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const id = parseInt(req.params.id);
+      const booking = await storage.getBooking(id);
+      
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found" });
+      }
+
+      res.json(booking);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching booking" });
+    }
+  });
+
+  app.post("/api/bookings", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      // Get boat information to find owner
+      const boat = await storage.getBoat(req.body.boatId);
+      if (!boat) {
+        return res.status(404).json({ error: "Boat not found" });
+      }
+
+      const bookingData = {
+        ...req.body,
+        customerId: req.user.id,
+        ownerId: boat.ownerId,
+        status: "pending" as const,
+        createdAt: new Date(),
+      };
+
+      const booking = await storage.createBooking(bookingData);
+      res.status(201).json(booking);
+    } catch (error) {
+      console.error("Error creating booking:", error);
+      res.status(500).json({ message: "Error creating booking" });
+    }
+  });
+
+  app.put("/api/bookings/:id", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const bookingId = parseInt(req.params.id);
+      const booking = await storage.getBooking(bookingId);
+      
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found" });
+      }
+
+      if (booking.customerId !== req.user.id && req.user.role !== "admin") {
+        return res.sendStatus(403);
+      }
+
+      const updatedBooking = await storage.updateBooking(bookingId, req.body);
+      res.json(updatedBooking);
+    } catch (error) {
+      res.status(500).json({ message: "Error updating booking" });
+    }
+  });
+
+  // Stripe payment route for one-time payments
+  app.post("/api/create-payment-intent", async (req, res) => {
+    try {
+      const { amount, currency = "eur" } = req.body;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: Math.round(amount * 100), // Convert to cents
+        currency: currency,
+        automatic_payment_methods: {
+          enabled: true,
+        },
+      });
+      res.json({ clientSecret: paymentIntent.client_secret });
+    } catch (error: any) {
+      res
+        .status(500)
+        .json({ message: "Error creating payment intent: " + error.message });
+    }
+  });
+
+      if (booking.customerId !== req.user.id) {
+        return res.status(403).json({ error: "Unauthorized" });
+      }
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: Math.round(parseFloat(booking.totalPrice) * 100), // Convert to cents
+        currency: "eur",
+        metadata: {
+          bookingId: bookingId.toString(),
+          customerId: req.user.id.toString(),
+        },
+      });
+
+      res.json({ clientSecret: paymentIntent.client_secret });
+    } catch (error) {
+      console.error("Error creating payment intent:", error);
+      res.status(500).json({ message: "Error creating payment intent" });
+    }
+  });
+
+  // Reviews endpoints
+  app.get("/api/reviews", async (req, res) => {
+    try {
+      const { bookingId, revieweeId, type } = req.query;
+      
+      const filters = {
+        bookingId: bookingId ? parseInt(bookingId as string) : undefined,
+        revieweeId: revieweeId ? parseInt(revieweeId as string) : undefined,
+        type: type as string,
+      };
+
+      const reviews = await storage.getReviews(filters);
+      res.json(reviews);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching reviews" });
+    }
+  });
+
+  app.post("/api/reviews", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const validation = insertReviewSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({ message: "Invalid review data" });
+      }
+
+      const review = await storage.createReview({
+        ...validation.data,
+        reviewerId: req.user.id,
+      });
+
+      res.status(201).json(review);
+    } catch (error) {
+      res.status(500).json({ message: "Error creating review" });
+    }
+  });
+
+  // Messages endpoints
+  app.get("/api/messages", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { senderId, receiverId, bookingId } = req.query;
+      
+      const filters = {
+        senderId: senderId ? parseInt(senderId as string) : undefined,
+        receiverId: receiverId ? parseInt(receiverId as string) : undefined,
+        bookingId: bookingId ? parseInt(bookingId as string) : undefined,
+      };
+
+      const messages = await storage.getMessages(filters);
+      res.json(messages);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching messages" });
+    }
+  });
+
+  app.post("/api/messages", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const validation = insertMessageSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({ message: "Invalid message data" });
+      }
+
+      const message = await storage.createMessage({
+        ...validation.data,
+        senderId: req.user.id,
+      });
+
+      res.status(201).json(message);
+    } catch (error) {
+      res.status(500).json({ message: "Error creating message" });
+    }
+  });
+
+  // Favorites endpoints
+  app.get("/api/favorites", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const favorites = await storage.getFavorites(req.user.id);
+      res.json(favorites);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching favorites" });
+    }
+  });
+
+  app.post("/api/favorites", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { boatId } = req.body;
+      const favorite = await storage.addFavorite(req.user.id, boatId);
+      res.status(201).json(favorite);
+    } catch (error) {
+      res.status(500).json({ message: "Error adding favorite" });
+    }
+  });
+
+  app.delete("/api/favorites/:boatId", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const boatId = parseInt(req.params.boatId);
+      await storage.removeFavorite(req.user.id, boatId);
+      res.sendStatus(204);
+    } catch (error) {
+      res.status(500).json({ message: "Error removing favorite" });
+    }
+  });
+
+  // Stripe payment endpoints
+  app.post("/api/create-payment-intent", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { bookingId } = req.body;
+
+      if (!bookingId) {
+        return res.status(400).json({ message: "Booking ID required" });
+      }
+
+      const booking = await storage.getBooking(bookingId);
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found" });
+      }
+
+      // Verify booking belongs to the authenticated user
+      if (booking.customerId !== req.user.id) {
+        return res.status(403).json({ message: "Unauthorized to access this booking" });
+      }
+
+      // Get boat details
+      const boat = await storage.getBoat(booking.boatId);
+      if (!boat) {
+        return res.status(404).json({ message: "Boat not found" });
+      }
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: Math.round(parseFloat(booking.totalPrice) * 100), // Convert to cents
+        currency: "eur",
+        metadata: {
+          bookingId: booking.id.toString(),
+          boatName: boat.name,
+        },
+      });
+
+      // Update booking with payment intent ID
+      await storage.updateBooking(booking.id, {
+        stripePaymentIntentId: paymentIntent.id,
+      });
+
+      res.json({
+        clientSecret: paymentIntent.client_secret,
+        booking: {
+          id: booking.id,
+          boatName: boat.name,
+          startDate: booking.startDate,
+          endDate: booking.endDate,
+          totalPrice: booking.totalPrice,
+        },
+      });
+    } catch (error: any) {
+      console.error("Payment intent creation error:", error);
+      res.status(500).json({ message: "Error creating payment intent: " + error.message });
+    }
+  });
+
+  // Webhook endpoint for Stripe events (payment confirmation)
+  app.post("/api/stripe/webhook", async (req, res) => {
+    try {
+      const sig = req.headers['stripe-signature'];
+      let event;
+
+      try {
+        event = stripe.webhooks.constructEvent(req.body, sig!, process.env.STRIPE_WEBHOOK_SECRET!);
+      } catch (err) {
+        console.error('Webhook signature verification failed:', err);
+        return res.status(400).send('Webhook signature verification failed');
+      }
+
+      if (event.type === 'payment_intent.succeeded') {
+        const paymentIntent = event.data.object;
+        const bookingId = paymentIntent.metadata.bookingId;
+
+        if (bookingId) {
+          // Update booking status to confirmed
+          await storage.updateBooking(parseInt(bookingId), {
+            status: 'confirmed',
+          });
+        }
+      }
+
+      res.json({ received: true });
+    } catch (error) {
+      console.error('Webhook error:', error);
+      res.status(500).json({ message: "Webhook error" });
+    }
+  });
+
+  // Chat endpoints
+  app.get("/api/conversations/:bookingId", async (req, res) => {
+    try {
+      const bookingId = parseInt(req.params.bookingId);
+      let conversation = await storage.getConversationByBooking(bookingId);
+      
+      // Create conversation if it doesn't exist
+      if (!conversation) {
+        conversation = await storage.createConversation({ bookingId });
+      }
+      
+      res.json(conversation);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching conversation" });
+    }
+  });
+
+  app.get("/api/conversations/:conversationId/messages", async (req, res) => {
+    try {
+      const conversationId = parseInt(req.params.conversationId);
+      const messages = await storage.getMessages(conversationId);
+      res.json(messages);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching messages" });
+    }
+  });
+
+  app.post("/api/conversations/:conversationId/messages", async (req, res) => {
+    try {
+      if (!req.user?.id) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
+
+      const conversationId = parseInt(req.params.conversationId);
+      const messageData = {
+        conversationId,
+        senderId: req.user.id,
+        content: req.body.content
+      };
+
+      const message = await storage.createMessage(messageData);
+      
+      // Broadcast message via WebSocket
+      const io = req.app.get('socketio');
+      if (io) {
+        io.to(`conversation-${conversationId}`).emit('new-message', {
+          ...message,
+          senderName: req.user.firstName ? `${req.user.firstName} ${req.user.lastName}` : req.user.email,
+          senderEmail: req.user.email
+        });
+      }
+      
+      res.status(201).json(message);
+    } catch (error) {
+      res.status(500).json({ message: "Error creating message" });
+    }
+  });
+
+  app.patch("/api/messages/:messageId/read", async (req, res) => {
+    try {
+      await storage.markMessageAsRead(parseInt(req.params.messageId));
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Error marking message as read" });
+    }
+  });
+
+  app.get("/api/user/unread-messages", async (req, res) => {
+    try {
+      if (!req.user?.id) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
+      
+      const count = await storage.getUnreadMessagesCount(req.user.id);
+      res.json({ count });
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching unread messages count" });
+    }
+  });
+
+  const httpServer = createServer(app);
+  
+  // Setup WebSocket server for real-time messaging
+  const { setupWebSocketServer } = await import("./routes/messaging");
+  setupWebSocketServer(httpServer);
+  
+  // Keep legacy Socket.IO for compatibility
+  const io = new SocketIOServer(httpServer, {
+    cors: {
+      origin: process.env.NODE_ENV === 'production' ? false : "*",
+      methods: ["GET", "POST"]
+    },
+    path: '/socket.io'
+  });
+
+  app.set('socketio', io);
+
+  io.on('connection', (socket: any) => {
+    console.log('User connected to chat:', socket.id);
+
+    socket.on('join-conversation', (conversationId: number) => {
+      socket.join(`conversation-${conversationId}`);
+      console.log(`User ${socket.id} joined conversation ${conversationId}`);
+    });
+
+    socket.on('leave-conversation', (conversationId: number) => {
+      socket.leave(`conversation-${conversationId}`);
+      console.log(`User ${socket.id} left conversation ${conversationId}`);
+    });
+
+    socket.on('disconnect', () => {
+      console.log('User disconnected from chat:', socket.id);
+    });
+  });
+
+  // AI Assistant endpoints
+  app.post("/api/ai/recommendations", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { input, context } = req.body;
+      const boats = await storage.getBoats({});
+      
+      const result = await aiService.getBoatRecommendations(
+        req.user.id,
+        context || {},
+        boats
+      );
+      
+      res.json({ response: result.explanation });
+    } catch (error) {
+      console.error("AI recommendations error:", error);
+      res.status(500).json({ message: "Error getting AI recommendations" });
+    }
+  });
+
+  app.post("/api/ai/pricing", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { input, context } = req.body;
+      const boats = await storage.getBoats({});
+      const boat = boats.find(b => b.id === context?.boatId);
+      
+      if (!boat) {
+        return res.status(404).json({ message: "Boat not found" });
+      }
+
+      const similarBoats = boats.filter(b => 
+        b.type === boat.type && b.id !== boat.id
+      );
+      
+      const analysis = await aiService.analyzePricing(boat, similarBoats);
+      
+      res.json({ response: analysis });
+    } catch (error) {
+      console.error("AI pricing error:", error);
+      res.status(500).json({ message: "Error analyzing pricing" });
+    }
+  });
+
+  app.post("/api/ai/weather", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { input, context } = req.body;
+      const advice = await aiService.getWeatherAdvice(
+        context?.location || input,
+        context?.dates || [new Date().toISOString()]
+      );
+      
+      res.json({ response: advice });
+    } catch (error) {
+      console.error("AI weather error:", error);
+      res.status(500).json({ message: "Error getting weather advice" });
+    }
+  });
+
+  app.post("/api/ai/itinerary", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { input, context } = req.body;
+      const itinerary = await aiService.planItinerary({
+        startLocation: context?.startLocation || "Roma",
+        duration: context?.duration || 7,
+        interests: context?.interests || ["mare", "cultura"],
+        boatType: context?.boatType || "yacht",
+        ...context
+      });
+      
+      res.json({ response: itinerary });
+    } catch (error) {
+      console.error("AI itinerary error:", error);
+      res.status(500).json({ message: "Error planning itinerary" });
+    }
+  });
+
+  // Notifications endpoints
+  app.get("/api/notifications", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const notifications = await storage.getNotifications(req.user.id);
+      res.json(notifications);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching notifications" });
+    }
+  });
+
+  app.patch("/api/notifications/:id/read", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      await storage.markNotificationAsRead(parseInt(req.params.id));
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Error marking notification as read" });
+    }
+  });
+
+  app.patch("/api/notifications/mark-all-read", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      await storage.markAllNotificationsAsRead(req.user.id);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Error marking all notifications as read" });
+    }
+  });
+
+  // Promotions endpoints
+  app.get("/api/promotions/active", async (req, res) => {
+    try {
+      const promotions = await storage.getActivePromotions();
+      res.json(promotions);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching promotions" });
+    }
+  });
+
+  app.post("/api/promotions/apply", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { code, totalAmount } = req.body;
+      const promotion = await storage.applyPromotion(code, totalAmount);
+      res.json(promotion);
+    } catch (error: any) {
+      res.status(400).json({ message: error.message || "Invalid promotion code" });
+    }
+  });
+
+  // Reviews endpoints  
+  app.get("/api/reviews", async (req, res) => {
+    try {
+      const { boatId } = req.query;
+      const reviews = await storage.getReviews(parseInt(boatId as string));
+      res.json(reviews);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching reviews" });
+    }
+  });
+
+  app.get("/api/reviews/stats", async (req, res) => {
+    try {
+      const { boatId } = req.query;
+      const stats = await storage.getReviewStats(parseInt(boatId as string));
+      res.json(stats);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching review stats" });
+    }
+  });
+
+  app.post("/api/reviews", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const validation = insertReviewSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({ message: "Invalid review data" });
+      }
+
+      const review = await storage.createReview({
+        ...validation.data,
+        reviewerId: req.user.id,
+      });
+
+      res.status(201).json(review);
+    } catch (error) {
+      res.status(500).json({ message: "Error creating review" });
+    }
+  });
+
+  // Analytics endpoints
+  app.get("/api/analytics", async (req, res) => {
+    if (!req.isAuthenticated() || req.user.role !== "owner") {
+      return res.sendStatus(403);
+    }
+
+    try {
+      const analytics = await storage.getAnalytics(req.user.id);
+      res.json(analytics);
+    } catch (error) {
+      res.status(500).json({ message: "Error fetching analytics" });
+    }
+  });
+
+  // Discount system routes
+  app.get("/api/discounts/available/:customerLevel", async (req, res) => {
+    try {
+      const { customerLevel } = req.params;
+      const discounts = await storage.getAvailableDiscounts(customerLevel);
+      res.json(discounts);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/discounts/apply", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { code, totalPrice, customerLevel } = req.body;
+      const result = await storage.applyDiscount(code, totalPrice, customerLevel, req.user.id);
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ message: error.message });
+    }
+  });
+
+  // Document management routes
+  app.get("/api/bookings/:bookingId/documents", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { bookingId } = req.params;
+      const documents = await storage.getDocuments(parseInt(bookingId));
+      res.json(documents);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/documents/upload", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      // File upload implementation would go here
+      // For now, simulate success
+      const { type, bookingId } = req.body;
+      const document = {
+        bookingId: parseInt(bookingId),
+        type,
+        fileName: "document.pdf",
+        filePath: "/uploads/document.pdf",
+        uploadedBy: req.user.id,
+        verified: false
+      };
+      
+      const newDocument = await storage.createDocument(document);
+      res.json(newDocument);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch("/api/documents/:documentId/verify", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { documentId } = req.params;
+      const { verified } = req.body;
+      const document = await storage.updateDocument(parseInt(documentId), {
+        verified,
+        verifiedBy: req.user.id
+      });
+      res.json(document);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Loyalty system routes
+  app.post("/api/users/:userId/update-loyalty", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.sendStatus(401);
+    }
+
+    try {
+      const { userId } = req.params;
+      const { totalSpent, pointsEarned } = req.body;
+      const user = await storage.updateUserLoyalty(parseInt(userId), totalSpent, pointsEarned);
+      res.json(user);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  return httpServer;
+}

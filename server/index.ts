@@ -1,42 +1,110 @@
-import express from 'express'
-import path from 'path'
-import { fileURLToPath } from 'url'
+import 'dotenv/config';
+import Stripe from "stripe";
+import cors from "cors";
+import express, { type Request, Response } from "express";
+import { registerRoutes } from "./routes";
+import { setupVite, serveStatic, log } from "./vite";
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+const app = express();
+app.enable("trust proxy");
 
-const app = express()
-const PORT = parseInt(process.env.PORT || '3001', 10)
+app.use((req, res, next) => {
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "");
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "");
 
-// Middleware
-app.use(express.json())
-app.use(express.urlencoded({ extended: true }))
+  // solo per i tuoi domini pubblici
+  const isOurDomain = /(^|\.)seaboo\.it$/i.test(host);
 
-// Serve static files from the React app build directory
-app.use(express.static(path.join(__dirname, '..', 'dist', 'public')))
+  if (isOurDomain) {
+    // se è il dominio senza www → aggiungi www
+    if (/^seaboo\.it$/i.test(host)) {
+      return res.redirect(301, `https://www.seaboo.it${req.originalUrl}`);
+    }
+    // se è www ma su http → forza https
+    if (proto !== "https") {
+      return res.redirect(301, `https://${host}${req.originalUrl}`);
+    }
+  }
+  next();
+});
 
-// API Routes
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'SeaBoo server is running!' })
-})
+// middleware base
+const ALLOWED_ORIGINS = [
+  "https://www.seaboo.it",
+  "https://seaboo.it",
+  "capacitor://localhost",
+  "http://localhost",
+  "http://localhost:5173",
+];
 
-app.get('/api/test', (req, res) => {
-  res.json({ 
-    message: 'API is working',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
-  })
-})
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
 
-// Catch all handler: send back React's index.html file for client-side routing
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '..', 'dist', 'public', 'index.html'))
-})
+// Preflight esplicito
+app.options("*", cors({
+  origin: ALLOWED_ORIGINS,
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+app.use((req, _res, next) => {
+  console.log("[REQ]", req.method, req.path);
+  next();
+});
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on http://0.0.0.0:${PORT}`)
-  console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`)
-})
+// Stripe
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
+  apiVersion: "2022-11-15",
+});
 
-export default app
+// === API (PRIMA di registerRoutes/serveStatic) ===
+app.get("/api/healthz", (_req, res) => res.json({ ok: true })); // test veloce
+
+app.post(
+  "/api/create-experience-payment",
+  async (req: Request, res: Response) => {
+    try {
+      const amount = Number(req.body?.amount);
+      const currency = String(req.body?.currency || "eur");
+      if (!process.env.STRIPE_SECRET_KEY)
+        return res.status(500).json({ error: "missing_secret" });
+      if (!Number.isFinite(amount) || amount <= 0)
+        return res.status(400).json({ error: "bad_amount" });
+
+      const intent = await stripe.paymentIntents.create({
+        amount, // es. 1000 = €10,00
+        currency, // es. 'eur'
+        automatic_payment_methods: { enabled: true },
+        description: "SeaBoo experience",
+      });
+
+      return res.json({ clientSecret: intent.client_secret });
+    } catch (e: any) {
+      console.error("[PAY][SERVER-ERR]", e?.message || e);
+      return res.status(500).json({ error: "stripe_failed" });
+    }
+  },
+);
+
+// routing/statici DOPO le API
+(async () => {
+  const server = await registerRoutes(app);
+  if (process.env.NODE_ENV === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+  const port = Number(process.env.PORT || 5000);
+  server.listen(port, "0.0.0.0", () =>
+    log(`🚀 Server running on port ${port}`),
+  );
+})();
