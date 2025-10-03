@@ -37,23 +37,28 @@ const ALLOWED_ORIGINS = [
   "http://localhost:5173",
 ];
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS blocked: ${origin}`));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
+// In development, allow all origins. In production, use specific allowed origins
+const corsOptions = process.env.NODE_ENV === 'development' 
+  ? {
+      origin: true, // Allow all origins in development
+      credentials: true,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
+    }
+  : {
+      origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+        return cb(new Error(`CORS blocked: ${origin}`));
+      },
+      credentials: true,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
+    };
+
+app.use(cors(corsOptions));
 
 // Preflight esplicito
-app.options("*", cors({
-  origin: ALLOWED_ORIGINS,
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use((req, _res, next) => {
@@ -61,10 +66,12 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Stripe
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
-  apiVersion: "2025-08-27.basil",
-});
+// Stripe (conditional)
+const stripe = process.env.STRIPE_SECRET_KEY 
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, {
+      apiVersion: "2025-08-27.basil",
+    })
+  : null;
 
 // === API (PRIMA di registerRoutes/serveStatic) ===
 app.get("/api/healthz", (_req, res) => res.json({ ok: true })); // test veloce
@@ -75,8 +82,8 @@ app.post(
     try {
       const amount = Number(req.body?.amount);
       const currency = String(req.body?.currency || "eur");
-      if (!process.env.STRIPE_SECRET_KEY)
-        return res.status(500).json({ error: "missing_secret" });
+      if (!stripe || !process.env.STRIPE_SECRET_KEY)
+        return res.status(503).json({ error: "payment_service_not_configured" });
       if (!Number.isFinite(amount) || amount <= 0)
         return res.status(400).json({ error: "bad_amount" });
 

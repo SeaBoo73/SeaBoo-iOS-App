@@ -9,7 +9,7 @@ import {
   MapPin,
   Users
 } from 'lucide-react';
-import seabooLogo from "@assets/WhatsApp Image 2025-08-19 at 12.38.33_1757318764148.jpeg";
+import seabooLogo from "@assets/seaboo-logo.png";
 import {
   DropdownMenu,
   DropdownMenuContent,

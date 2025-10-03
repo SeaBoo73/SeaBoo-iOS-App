@@ -12,10 +12,12 @@ import Stripe from "stripe";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Initialize Stripe
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2025-08-27.basil',
-});
+// Initialize Stripe (conditional)
+const stripe = process.env.STRIPE_SECRET_KEY 
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, {
+      apiVersion: '2025-08-27.basil',
+    })
+  : null;
 
 // Extend session type
 declare module 'express-session' {
@@ -396,6 +398,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Invalid amount' });
       }
 
+      if (!stripe) {
+        return res.status(503).json({ error: 'Payment service not configured' });
+      }
+
       const paymentIntent = await stripe.paymentIntents.create({
         amount: Math.round(amount * 100), // Convert to cents
         currency: currency,
@@ -419,6 +425,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Stripe Webhook Endpoint
   app.post('/api/stripe/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Payment service not configured' });
+    }
+
     const sig = req.headers['stripe-signature'];
     let event;
 
