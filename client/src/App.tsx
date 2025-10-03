@@ -3,6 +3,7 @@ import { Router, Route } from 'wouter'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Header } from './components/header'
 import { Footer } from './components/footer'
+import { AuthPage } from './pages/auth-page'
 
 // Create a client
 const queryClient = new QueryClient({
@@ -55,6 +56,7 @@ function App() {
           <Header />
           <main>
             <Route path="/" component={HomePage} />
+            <Route path="/auth" component={AuthPage} />
             <Route path="/esperienze">
               <div className="max-w-7xl mx-auto px-4 py-8">
                 <h1 className="text-3xl font-bold">Esperienze</h1>

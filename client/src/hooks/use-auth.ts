@@ -1,71 +1,75 @@
-import { useState, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 interface User {
   id: number
   email: string
-  name?: string
+  firstName?: string
+  lastName?: string
   role?: string
-}
-
-interface AuthState {
-  user: User | null
-  isLoading: boolean
-  isAuthenticated: boolean
+  userType?: string
+  businessName?: string
 }
 
 export function useAuth() {
-  const [authState, setAuthState] = useState<AuthState>({
-    user: null,
-    isLoading: true,
-    isAuthenticated: false
-  })
-
   const queryClient = useQueryClient()
 
-  // Simulate user session check
-  useEffect(() => {
-    // For now, simulate no user (development mode)
-    setAuthState({
-      user: null,
-      isLoading: false,
-      isAuthenticated: false
-    })
-  }, [])
+  // Query current user session from backend
+  const { data: user, isLoading } = useQuery<User | null>({
+    queryKey: ['/api/user'],
+    queryFn: async () => {
+      const response = await fetch('/api/user', {
+        credentials: 'include'
+      })
+      if (!response.ok) {
+        return null
+      }
+      const data = await response.json()
+      return data.user || null
+    },
+    retry: false,
+    staleTime: 5 * 60 * 1000
+  })
 
   const logoutMutation = useMutation({
     mutationFn: async () => {
-      // Simulate logout
-      setAuthState({
-        user: null,
-        isLoading: false,
-        isAuthenticated: false
+      const response = await fetch('/api/logout', {
+        method: 'POST',
+        credentials: 'include'
       })
+      if (!response.ok) {
+        throw new Error('Logout fallito')
+      }
+      return response.json()
     },
     onSuccess: () => {
+      queryClient.setQueryData(['/api/user'], null)
       queryClient.clear()
     }
   })
 
   const loginMutation = useMutation({
     mutationFn: async (credentials: { email: string; password: string }) => {
-      // Simulate login
-      const user: User = {
-        id: 1,
-        email: credentials.email,
-        name: 'Demo User'
-      }
-      setAuthState({
-        user,
-        isLoading: false,
-        isAuthenticated: true
+      const response = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credentials),
+        credentials: 'include'
       })
-      return user
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.error || 'Login fallito')
+      }
+      return response.json()
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData(['/api/user'], data.user)
     }
   })
 
   return {
-    ...authState,
+    user: user || null,
+    isLoading,
+    isAuthenticated: !!user,
     loginMutation,
     logoutMutation
   }
