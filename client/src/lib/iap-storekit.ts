@@ -1,19 +1,23 @@
 /**
- * iOS In-App Purchase (StoreKit) Integration
- * Uses Capacitor bridge to call native Swift code
- * 
- * IMPORTANT: Requires native iOS Swift implementation in the Xcode project
+ * iOS In-App Purchase usando cordova-plugin-purchase
+ * Compatibile con Capacitor, funziona su iOS
  */
 
 import { Capacitor } from '@capacitor/core';
-import { registerPlugin } from '@capacitor/core';
+
+// Declare global CdvPurchase object (from cordova-plugin-purchase)
+declare global {
+  interface Window {
+    CdvPurchase?: any;
+  }
+}
 
 export interface IAPProduct {
-  productId: string;
+  id: string;
   title: string;
   description: string;
   price: string;
-  priceValue: number;
+  priceMicros: number;
   currency: string;
 }
 
@@ -21,184 +25,178 @@ export interface PurchaseResult {
   success: boolean;
   transactionId?: string;
   productId?: string;
-  receipt?: string;
   error?: string;
 }
 
-// Define the plugin interface
-interface StoreKitPlugin {
-  getProducts(options: { productIds: string[] }): Promise<{ products: IAPProduct[] }>;
-  purchase(options: { productId: string }): Promise<PurchaseResult>;
-  restorePurchases(): Promise<{ transactions: any[] }>;
-  finishTransaction(options: { transactionId: string }): Promise<void>;
+/**
+ * Initialize the purchase plugin
+ */
+export async function initializeIAP(): Promise<void> {
+  if (!isIAPAvailable()) {
+    return;
+  }
+
+  const { store, ProductType, Platform } = window.CdvPurchase;
+
+  // Register products
+  store.register([
+    { id: SEABOO_PRODUCTS.BOAT_RENTAL_BASIC, type: ProductType.CONSUMABLE, platform: Platform.APPLE_APPSTORE },
+    { id: SEABOO_PRODUCTS.BOAT_RENTAL_PREMIUM, type: ProductType.CONSUMABLE, platform: Platform.APPLE_APPSTORE },
+    { id: SEABOO_PRODUCTS.EXPERIENCE_SUNSET, type: ProductType.CONSUMABLE, platform: Platform.APPLE_APPSTORE },
+    { id: SEABOO_PRODUCTS.EXPERIENCE_DIVING, type: ProductType.CONSUMABLE, platform: Platform.APPLE_APPSTORE },
+    { id: SEABOO_PRODUCTS.EXPERIENCE_FISHING, type: ProductType.CONSUMABLE, platform: Platform.APPLE_APPSTORE },
+  ]);
+
+  // Initialize the store
+  await store.initialize([Platform.APPLE_APPSTORE]);
 }
 
-// Register the plugin (will be implemented in native iOS code)
-const StoreKit = registerPlugin<StoreKitPlugin>('StoreKit');
-
 /**
- * Check if In-App Purchase is available (iOS only)
+ * Check if In-App Purchase is available
  */
 export function isIAPAvailable(): boolean {
-  return Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'ios';
+  return Capacitor.isNativePlatform() && 
+         Capacitor.getPlatform() === 'ios' && 
+         typeof window.CdvPurchase !== 'undefined';
 }
 
 /**
- * Fetch available products from StoreKit
+ * Get available products
  */
 export async function fetchProducts(productIds: string[]): Promise<IAPProduct[]> {
   if (!isIAPAvailable()) {
-    throw new Error('In-App Purchase non disponibile su questa piattaforma');
+    throw new Error('In-App Purchase non disponibile');
   }
 
-  try {
-    const response = await StoreKit.getProducts({ productIds });
-    return response.products;
-  } catch (error: any) {
-    console.error('Error fetching products:', error);
-    throw new Error('Impossibile caricare i prodotti disponibili');
+  const { store } = window.CdvPurchase;
+  const products: IAPProduct[] = [];
+
+  for (const id of productIds) {
+    const product = store.get(id);
+    if (product && product.canPurchase) {
+      products.push({
+        id: product.id,
+        title: product.title || id,
+        description: product.description || '',
+        price: product.pricing?.price || '€0.00',
+        priceMicros: product.pricing?.priceMicros || 0,
+        currency: product.pricing?.currency || 'EUR'
+      });
+    }
   }
+
+  return products;
 }
 
 /**
- * Purchase a product using StoreKit
- * @param productId - The product identifier (e.g., "it.seaboo.rental.basic")
- * @param bookingId - The booking ID to associate with this purchase
+ * Purchase a product
  */
 export async function purchaseProduct(
-  productId: string, 
+  productId: string,
   bookingId: number
 ): Promise<PurchaseResult> {
   if (!isIAPAvailable()) {
     return {
       success: false,
-      error: 'In-App Purchase non disponibile su questa piattaforma'
+      error: 'In-App Purchase non disponibile'
     };
   }
 
-  try {
-    // Call native StoreKit purchase
-    const purchaseResponse = await StoreKit.purchase({ productId });
-    
-    if (!purchaseResponse.receipt) {
-      return {
-        success: false,
-        error: 'Nessuna ricevuta ricevuta da Apple'
-      };
-    }
+  return new Promise((resolve) => {
+    const { store } = window.CdvPurchase;
 
-    const transactionId = purchaseResponse.transactionId!;
-    const receipt = purchaseResponse.receipt;
+    // Set up receipt validator
+    store.validator = async (receipt: any) => {
+      try {
+        const response = await fetch('/api/verify-purchase', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            receipt: receipt.data,
+            transactionId: receipt.id,
+            productId,
+            bookingId: bookingId.toString()
+          })
+        });
 
-    // Verify receipt with backend
-    const verifyResponse = await fetch('/api/verify-purchase', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      credentials: 'include',
-      body: JSON.stringify({
-        receipt,
-        transactionId,
-        productId,
-        bookingId: bookingId.toString()
-      })
+        if (!response.ok) {
+          const error = await response.json();
+          return {
+            ok: false,
+            error: { message: error.error || 'Verifica fallita' }
+          };
+        }
+
+        return { ok: true };
+      } catch (error: any) {
+        return {
+          ok: false,
+          error: { message: error.message || 'Errore di rete' }
+        };
+      }
+    };
+
+    // Listen for purchase events
+    store.when().approved((transaction: any) => {
+      transaction.finish();
+      resolve({
+        success: true,
+        transactionId: transaction.transactionId,
+        productId: transaction.products[0]?.id
+      });
     });
 
-    if (!verifyResponse.ok) {
-      const error = await verifyResponse.json();
-      
-      // Finish the transaction even if backend verification fails
-      try {
-        await StoreKit.finishTransaction({ transactionId });
-      } catch (e) {
-        console.error('Failed to finish transaction:', e);
-      }
-      
-      return {
-        success: false,
-        error: error.error || 'Verifica pagamento fallita'
-      };
-    }
-
-    const result = await verifyResponse.json();
-
-    // Finish the transaction successfully
-    await StoreKit.finishTransaction({ transactionId });
-
-    return {
-      success: true,
-      transactionId,
-      productId
-    };
-
-  } catch (error: any) {
-    console.error('Purchase error:', error);
-    
-    // Handle user cancellation
-    if (error.code === 'ERR_PAYMENT_CANCELLED' || error.message?.includes('cancelled')) {
-      return {
+    store.when().cancelled(() => {
+      resolve({
         success: false,
         error: 'Acquisto annullato'
-      };
+      });
+    });
+
+    store.when().error((error: any) => {
+      resolve({
+        success: false,
+        error: error.message || 'Errore durante l\'acquisto'
+      });
+    });
+
+    // Start the purchase
+    const offer = store.get(productId)?.getOffer();
+    if (!offer) {
+      resolve({
+        success: false,
+        error: 'Prodotto non disponibile'
+      });
+      return;
     }
 
-    return {
-      success: false,
-      error: error.message || 'Errore durante l\'acquisto'
-    };
-  }
+    store.order(offer);
+  });
 }
 
 /**
- * Restore previous purchases (required by Apple App Store guidelines)
+ * Restore purchases
  */
 export async function restorePurchases(): Promise<{ count: number; error?: string }> {
   if (!isIAPAvailable()) {
-    return {
-      count: 0,
-      error: 'In-App Purchase non disponibile su questa piattaforma'
-    };
+    return { count: 0, error: 'IAP non disponibile' };
   }
 
   try {
-    const response = await StoreKit.restorePurchases();
-    
-    if (response.transactions && response.transactions.length > 0) {
-      // Process each restored transaction
-      for (const transaction of response.transactions) {
-        try {
-          await fetch('/api/restore-purchase', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify({
-              transactionId: transaction.transactionId,
-              productId: transaction.productId,
-              receipt: transaction.receipt
-            })
-          });
-        } catch (error) {
-          console.error('Error restoring transaction:', transaction.transactionId, error);
-        }
-      }
-      
-      return { count: response.transactions.length };
-    }
-    
-    return { count: 0 };
+    const { store } = window.CdvPurchase;
+    await store.restorePurchases();
+    return { count: 0 }; // Il plugin gestisce automaticamente il restore
   } catch (error: any) {
-    console.error('Restore purchases error:', error);
     return {
       count: 0,
-      error: 'Errore durante il ripristino acquisti'
+      error: error.message || 'Errore durante il ripristino'
     };
   }
 }
 
 /**
- * Product IDs for SeaBoo experiences/bookings
- * These MUST match the products configured in App Store Connect
+ * Product IDs - devono corrispondere a quelli in App Store Connect
  */
 export const SEABOO_PRODUCTS = {
   BOAT_RENTAL_BASIC: 'it.seaboo.rental.basic',
@@ -209,17 +207,12 @@ export const SEABOO_PRODUCTS = {
 } as const;
 
 /**
- * Get product ID for a booking based on price
- * This maps SeaBoo booking prices to App Store product IDs
+ * Map booking price to product ID
  */
 export function getProductIdForBooking(totalPrice: number): string {
-  // Map price ranges to product IDs
   if (totalPrice <= 100) {
     return SEABOO_PRODUCTS.BOAT_RENTAL_BASIC;
-  } else if (totalPrice <= 500) {
-    return SEABOO_PRODUCTS.BOAT_RENTAL_PREMIUM;
   } else {
-    // For higher prices, use premium
     return SEABOO_PRODUCTS.BOAT_RENTAL_PREMIUM;
   }
 }

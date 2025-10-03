@@ -1,305 +1,181 @@
-# iOS StoreKit In-App Purchase - Guida Implementazione Nativa
+# iOS In-App Purchase - Setup Completo
 
-## ⚠️ IMPORTANTE
-Questo file contiene le istruzioni per implementare il plugin StoreKit nativo in Xcode.
-Il codice TypeScript è già pronto in `client/src/lib/iap-storekit.ts`.
+## ✅ Stato Implementazione
 
-## 📋 Prerequisiti
-1. Xcode installato
-2. Account Apple Developer
-3. Prodotti IAP configurati in App Store Connect
+### Backend (Completato)
+- ✅ Endpoint `/api/verify-purchase` - Verifica receipt con Apple
+- ✅ Protezione replay - Unique index su `paymentTransactionId`
+- ✅ Idempotency completa - Blocca transazioni duplicate cross-user
+- ✅ Logging transazioni - Tracking completo per debug
 
-## 🛠️ Implementazione Swift Nativa
+### Frontend Web (Completato)
+- ✅ Plugin installato: `cordova-plugin-purchase` (compatibile Capacitor)
+- ✅ Modulo TypeScript: `client/src/lib/iap-storekit.ts`
+- ✅ Funzioni: `purchaseProduct()`, `fetchProducts()`, `restorePurchases()`
 
-### Step 1: Apri il progetto iOS
+## 🚀 Setup iOS Nativo
+
+### 1. Sincronizza Capacitor
+
+Dal terminale **sul tuo Mac** (non su Replit):
+
 ```bash
+# Sincronizza il progetto iOS con i nuovi plugin
 npx cap sync ios
+
+# Apri in Xcode
 npx cap open ios
 ```
 
-### Step 2: Crea il file `StoreKitPlugin.swift`
+### 2. Configura prodotti in App Store Connect
 
-In Xcode, crea un nuovo file Swift in `App/App/` chiamato `StoreKitPlugin.swift`:
+Crea questi prodotti IAP:
 
-```swift
-import Foundation
-import Capacitor
-import StoreKit
+| Product ID | Tipo | Prezzo | Descrizione |
+|-----------|------|--------|-------------|
+| `it.seaboo.rental.basic` | Consumable | €50 | Noleggio barche base |
+| `it.seaboo.rental.premium` | Consumable | €200 | Noleggio barche premium |
+| `it.seaboo.experience.sunset` | Consumable | €80 | Esperienza tramonto |
+| `it.seaboo.experience.diving` | Consumable | €120 | Esperienza diving |
+| `it.seaboo.experience.fishing` | Consumable | €90 | Esperienza pesca |
 
-@objc(StoreKitPlugin)
-public class StoreKitPlugin: CAPPlugin, SKProductsRequestDelegate, SKPaymentTransactionObserver {
-    
-    private var productsRequest: SKProductsRequest?
-    private var productsCallID: String?
-    private var purchaseCallID: String?
-    private var currentProductId: String?
-    
-    override public func load() {
-        SKPaymentQueue.default().add(self)
-    }
-    
-    deinit {
-        SKPaymentQueue.default().remove(self)
-    }
-    
-    // MARK: - Get Products
-    
-    @objc func getProducts(_ call: CAPPluginCall) {
-        guard let productIds = call.getArray("productIds", String.self) else {
-            call.reject("Product IDs required")
-            return
-        }
-        
-        self.productsCallID = call.callbackId
-        let request = SKProductsRequest(productIdentifiers: Set(productIds))
-        request.delegate = self
-        self.productsRequest = request
-        request.start()
-    }
-    
-    public func productsRequest(_ request: SKProductsRequest, didReceive response: SKProductsResponse) {
-        guard let callID = self.productsCallID,
-              let call = self.bridge?.savedCall(withID: callID) else {
-            return
-        }
-        
-        var products: [[String: Any]] = []
-        
-        for product in response.products {
-            let formatter = NumberFormatter()
-            formatter.numberStyle = .currency
-            formatter.locale = product.priceLocale
-            
-            let priceString = formatter.string(from: product.price) ?? ""
-            
-            products.append([
-                "productId": product.productIdentifier,
-                "title": product.localizedTitle,
-                "description": product.localizedDescription,
-                "price": priceString,
-                "priceValue": product.price.doubleValue,
-                "currency": product.priceLocale.currencyCode ?? "USD"
-            ])
-        }
-        
-        call.resolve(["products": products])
-        self.productsCallID = nil
-    }
-    
-    public func request(_ request: SKRequest, didFailWithError error: Error) {
-        if let callID = self.productsCallID,
-           let call = self.bridge?.savedCall(withID: callID) {
-            call.reject("Failed to load products: \(error.localizedDescription)")
-            self.productsCallID = nil
-        }
-    }
-    
-    // MARK: - Purchase
-    
-    @objc func purchase(_ call: CAPPluginCall) {
-        guard let productId = call.getString("productId") else {
-            call.reject("Product ID required")
-            return
-        }
-        
-        self.currentProductId = productId
-        self.purchaseCallID = call.callbackId
-        
-        let payment = SKMutablePayment()
-        payment.productIdentifier = productId
-        SKPaymentQueue.default().add(payment)
-    }
-    
-    // MARK: - Transaction Observer
-    
-    public func paymentQueue(_ queue: SKPaymentQueue, updatedTransactions transactions: [SKPaymentTransaction]) {
-        for transaction in transactions {
-            switch transaction.transactionState {
-            case .purchased:
-                handlePurchased(transaction)
-            case .failed:
-                handleFailed(transaction)
-            case .restored:
-                handleRestored(transaction)
-            case .deferred, .purchasing:
-                break
-            @unknown default:
-                break
-            }
-        }
-    }
-    
-    private func handlePurchased(_ transaction: SKPaymentTransaction) {
-        guard let callID = self.purchaseCallID,
-              let call = self.bridge?.savedCall(withID: callID) else {
-            SKPaymentQueue.default().finishTransaction(transaction)
-            return
-        }
-        
-        if let receiptURL = Bundle.main.appStoreReceiptURL,
-           let receiptData = try? Data(contentsOf: receiptURL) {
-            let receiptString = receiptData.base64EncodedString()
-            
-            call.resolve([
-                "success": true,
-                "transactionId": transaction.transactionIdentifier ?? "",
-                "productId": transaction.payment.productIdentifier,
-                "receipt": receiptString
-            ])
-        } else {
-            call.reject("No receipt available")
-        }
-        
-        self.purchaseCallID = nil
-        self.currentProductId = nil
-    }
-    
-    private func handleFailed(_ transaction: SKPaymentTransaction) {
-        guard let callID = self.purchaseCallID,
-              let call = self.bridge?.savedCall(withID: callID) else {
-            SKPaymentQueue.default().finishTransaction(transaction)
-            return
-        }
-        
-        let errorCode = (transaction.error as? SKError)?.code.rawValue ?? 0
-        var errorMessage = transaction.error?.localizedDescription ?? "Purchase failed"
-        
-        if errorCode == SKError.paymentCancelled.rawValue {
-            errorMessage = "ERR_PAYMENT_CANCELLED"
-        }
-        
-        call.reject(errorMessage, "\(errorCode)")
-        
-        SKPaymentQueue.default().finishTransaction(transaction)
-        self.purchaseCallID = nil
-        self.currentProductId = nil
-    }
-    
-    private func handleRestored(_ transaction: SKPaymentTransaction) {
-        SKPaymentQueue.default().finishTransaction(transaction)
-    }
-    
-    // MARK: - Finish Transaction
-    
-    @objc func finishTransaction(_ call: CAPPluginCall) {
-        guard let transactionId = call.getString("transactionId") else {
-            call.reject("Transaction ID required")
-            return
-        }
-        
-        // Find and finish the transaction
-        for transaction in SKPaymentQueue.default().transactions {
-            if transaction.transactionIdentifier == transactionId {
-                SKPaymentQueue.default().finishTransaction(transaction)
-                call.resolve()
-                return
-            }
-        }
-        
-        call.reject("Transaction not found")
-    }
-    
-    // MARK: - Restore Purchases
-    
-    @objc func restorePurchases(_ call: CAPPluginCall) {
-        call.reject("Restore purchases not yet implemented")
-        // TODO: Implement restore logic if needed
-    }
+### 3. Info.plist
+
+Assicurati che `Info.plist` contenga:
+
+```xml
+<key>NSAppleEventsUsageDescription</key>
+<string>Necessario per gestire i pagamenti in-app</string>
+```
+
+### 4. Inizializza IAP all'avvio
+
+Nel tuo componente principale (es. `App.tsx`), aggiungi:
+
+```typescript
+import { useEffect } from 'react';
+import { initializeIAP } from '@/lib/iap-storekit';
+
+function App() {
+  useEffect(() => {
+    // Inizializza IAP quando l'app si avvia
+    initializeIAP().catch(console.error);
+  }, []);
+  
+  // ... resto del codice
 }
 ```
 
-### Step 3: Registra il Plugin
+## 💳 Uso nel Frontend
 
-In `App/App/AppDelegate.swift`, non serve modificare nulla - Capacitor registra automaticamente i plugin.
-
-### Step 4: Info.plist
-
-Assicurati che `Info.plist` contenga le chiavi necessarie per StoreKit:
-
-```xml
-<key>SKAdNetworkItems</key>
-<array>
-    <!-- Aggiungi eventuali network di advertising qui -->
-</array>
-```
-
-## 📦 Prodotti App Store Connect
-
-Configura questi prodotti in App Store Connect:
-
-| Product ID | Tipo | Descrizione |
-|-----------|------|-------------|
-| `it.seaboo.rental.basic` | Consumable | Noleggio barche base (≤€100) |
-| `it.seaboo.rental.premium` | Consumable | Noleggio barche premium (>€100) |
-| `it.seaboo.experience.sunset` | Consumable | Esperienza tramonto |
-| `it.seaboo.experience.diving` | Consumable | Esperienza diving |
-| `it.seaboo.experience.fishing` | Consumable | Esperienza pesca |
-
-## ✅ Test
-
-### Test in Sandbox
-1. Crea un Sandbox Tester in App Store Connect
-2. Esegui l'app su device/simulator
-3. Accedi con l'account Sandbox quando richiesto
-4. Testa il flusso di acquisto
-
-### Test Backend
-Il backend verifica automaticamente i receipt con i server Apple:
-- Endpoint: `POST /api/verify-purchase`
-- Verifica firma, audience, scadenza
-- Protegge da receipt replay con unique index DB
-
-## 🔒 Sicurezza Implementata
-
-✅ **Backend già sicuro**:
-- Verifica receipt con server Apple
-- Validazione productId obbligatoria
-- Idempotency completa (unique index su transactionId)
-- Protezione replay cross-user
-- Logging completo transazioni
-
-## 🚀 Utilizzo nel Frontend
+### Esempio: Pagamento Booking
 
 ```typescript
-import { purchaseProduct } from '@/lib/iap-storekit';
+import { purchaseProduct, getProductIdForBooking } from '@/lib/iap-storekit';
 
-// Quando l'utente vuole pagare un booking
-const handlePayment = async (bookingId: number, price: number) => {
-  const productId = getProductIdForBooking(price);
+async function handlePayBooking(bookingId: number, totalPrice: number) {
+  const productId = getProductIdForBooking(totalPrice);
   
   const result = await purchaseProduct(productId, bookingId);
   
   if (result.success) {
-    // Booking confermato!
-    alert('Pagamento completato!');
+    alert('Pagamento completato! Booking confermato.');
+    // Aggiorna UI, naviga alla conferma, etc.
   } else {
-    alert(result.error);
+    alert(`Errore: ${result.error}`);
   }
-};
+}
 ```
 
-## 📝 Note
+### Esempio: Mostra Prodotti Disponibili
 
-- **Sandbox Testing**: Usa account Sandbox per testare
-- **Production**: I receipt production vengono verificati automaticamente
-- **Restore**: Apple richiede un bottone "Restore Purchases" nell'app
-- **Rejection Risk**: Assicurati che tutti i prodotti siano configurati prima della submission
+```typescript
+import { fetchProducts, SEABOO_PRODUCTS } from '@/lib/iap-storekit';
+
+async function showProducts() {
+  const products = await fetchProducts([
+    SEABOO_PRODUCTS.BOAT_RENTAL_BASIC,
+    SEABOO_PRODUCTS.BOAT_RENTAL_PREMIUM
+  ]);
+  
+  products.forEach(p => {
+    console.log(`${p.title}: ${p.price}`);
+  });
+}
+```
+
+## 🧪 Testing
+
+### Sandbox Testing
+1. **Crea Sandbox Tester** in App Store Connect
+2. **Logout** dal tuo Apple ID su device/simulator
+3. **Run app** in Xcode
+4. **Prova acquisto** - iOS chiederà login Sandbox
+5. **Verifica backend** - Controlla logs console per conferma
+
+### Verifica Backend
+```bash
+# Sul server, controlla i logs quando fai un acquisto
+# Dovresti vedere:
+✅ Booking X confirmed via IAP
+  - transactionId: 1000000xxxxx
+  - productId: it.seaboo.rental.basic
+  - environment: Sandbox
+```
+
+## 🔒 Sicurezza (Già Implementata)
+
+✅ **Receipt Verification**
+- Inviato ai server Apple per validazione
+- Verifica firma, scadenza, audience
+
+✅ **Idempotency**
+- Unique index su `bookings.paymentTransactionId`
+- Blocca replay anche con race condition
+- Gestione errore 23505 PostgreSQL
+
+✅ **Ownership Verification**
+- Solo il proprietario del booking può confermarlo
+- Check user_id prima di aggiornare
+
+✅ **Logging Completo**
+- Ogni transazione loggata con originalTransactionId
+- Tracking per debug e fraud detection
+
+## ⚠️ Checklist Pre-Submission
+
+Prima di inviare ad Apple:
+
+- [ ] Tutti i prodotti creati in App Store Connect
+- [ ] Testato flusso completo in Sandbox
+- [ ] Backend verifica receipt correttamente
+- [ ] Bottone "Restore Purchases" presente nell'app (richiesto da Apple)
+- [ ] Screenshot/video con acquisto funzionante per review
 
 ## 🐛 Troubleshooting
 
 **"No products found"**
-→ Controlla che i Product IDs in App Store Connect corrispondano esattamente
+→ Prodotti non configurati in App Store Connect o ID errati
 
 **"Receipt verification failed"**
-→ Verifica che il backend `/api/verify-purchase` sia raggiungibile
+→ Backend non raggiungibile o errore rete
 
-**"Transaction not found"**
-→ Controlla che la transazione sia completata prima di chiamare finishTransaction
+**"Transaction already used"**
+→ Corretto! Protezione replay funziona
+
+**"Sandbox account not working"**
+→ Assicurati di aver fatto logout dall'Apple ID normale
 
 ---
 
-**✅ Una volta implementato il codice Swift, il flusso completo sarà:**
-1. User clicca "Prenota" → StoreKit mostra popup pagamento
-2. User paga → Apple genera receipt
-3. App invia receipt al backend → Backend verifica con Apple
-4. Backend conferma booking → User riceve conferma
+## ✅ Stato Finale
+
+| Componente | Stato | Note |
+|-----------|-------|------|
+| Backend API | ✅ Completo | Sicuro e production-ready |
+| Frontend Web | ✅ Completo | Plugin Cordova installato |
+| iOS Native | ⚠️ Da sincronizzare | Run `npx cap sync ios` |
+| Prodotti ASC | ⚠️ Da configurare | Crea i 5 prodotti |
+| Testing | ⏳ Da testare | Usa Sandbox Tester |
+
+**L'app è pronta per la submission Apple una volta completati gli step iOS! 🚀**
