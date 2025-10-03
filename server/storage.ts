@@ -130,14 +130,16 @@ export class DatabaseStorage implements IStorage {
       .select({
         id: bookings.id,
         createdAt: bookings.createdAt,
+        updatedAt: bookings.updatedAt,
+        userId: bookings.userId,
         customerId: bookings.customerId,
         boatId: bookings.boatId,
         startDate: bookings.startDate,
         endDate: bookings.endDate,
         totalPrice: bookings.totalPrice,
         status: bookings.status,
+        guestCount: bookings.guestCount,
         specialRequests: bookings.specialRequests,
-        updatedAt: bookings.updatedAt,
       })
       .from(bookings)
       .innerJoin(boats, eq(bookings.boatId, boats.id))
