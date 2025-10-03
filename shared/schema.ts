@@ -1,4 +1,4 @@
-import { pgTable, serial, text, varchar, integer, timestamp, boolean, real, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, varchar, integer, timestamp, boolean, real, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -56,9 +56,14 @@ export const bookings = pgTable("bookings", {
   status: varchar("status", { length: 50 }).default("pending").notNull(),
   guestCount: integer("guest_count"),
   specialRequests: text("special_requests"),
+  paymentTransactionId: varchar("payment_transaction_id", { length: 255 }), // Apple transaction ID for IAP
+  paymentProvider: varchar("payment_provider", { length: 50 }), // 'apple' or 'stripe'
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
-});
+}, (table) => ({
+  // Unique index to prevent receipt replay - ensures each Apple transaction can only be used once
+  uniquePaymentTransaction: uniqueIndex("unique_payment_transaction").on(table.paymentTransactionId),
+}));
 
 // Reviews table
 export const reviews = pgTable("reviews", {

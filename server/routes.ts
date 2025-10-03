@@ -2,13 +2,17 @@ import type { Express } from "express";
 import express from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { insertUserSchema, insertOwnerSchema, insertUserOnlySchema, loginSchema, insertBoatSchema } from "@shared/schema";
+import { insertUserSchema, insertOwnerSchema, insertUserOnlySchema, loginSchema, insertBoatSchema, bookings } from "@shared/schema";
 import session from "express-session";
 import connectPg from "connect-pg-simple";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from 'url';
 import Stripe from "stripe";
+import bcrypt from "bcryptjs";
+import appleSignin from "apple-signin-auth";
+import { db } from "./db";
+import { eq } from "drizzle-orm";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -158,6 +162,286 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ user: req.session.user });
     } else {
       res.status(401).json({ error: "Non autenticato" });
+    }
+  });
+
+  // Apple Sign In endpoint
+  app.post('/api/auth/apple', async (req, res) => {
+    try {
+      const { identityToken, user: appleUser, nonce } = req.body;
+      
+      if (!identityToken) {
+        return res.status(400).json({ error: "Token Apple mancante" });
+      }
+
+      // Verify the identity token with Apple's public keys
+      const appleIdTokenPayload = await appleSignin.verifyIdToken(identityToken, {
+        audience: process.env.APPLE_CLIENT_ID || 'it.seaboo.app', // Your app's bundle ID
+        nonce: nonce, // Nonce for replay attack prevention
+        ignoreExpiration: false, // Enforce token expiration
+      });
+      
+      const appleEmail = appleIdTokenPayload.email || appleUser?.email;
+      const appleSub = appleIdTokenPayload.sub; // Stable user identifier from Apple
+      
+      if (!appleEmail) {
+        return res.status(400).json({ error: "Email Apple non disponibile" });
+      }
+
+      // Check if user exists by Apple ID or email
+      let user = await storage.getUserByEmail(appleEmail);
+      
+      if (!user) {
+        // Create new user with Apple Sign In
+        user = await storage.createUser({
+          email: appleEmail,
+          password: await bcrypt.hash(Math.random().toString(36), 12), // Random password for Apple users
+          firstName: appleUser?.name?.firstName || appleUser?.givenName,
+          lastName: appleUser?.name?.lastName || appleUser?.familyName,
+          role: 'user',
+          username: `apple_${appleSub.substring(0, 10)}` // Unique username from Apple ID
+        });
+      }
+
+      // Store user in session
+      req.session.user = {
+        id: user.id.toString(),
+        email: user.email,
+        firstName: user.firstName || undefined,
+        lastName: user.lastName || undefined,
+        role: user.role || "user",
+        userType: "customer",
+        businessName: user.businessName || undefined
+      };
+
+      res.json({ 
+        success: true, 
+        user: {
+          id: user.id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          userType: "customer"
+        }
+      });
+    } catch (error: any) {
+      console.error("Apple Sign In error:", error);
+      res.status(401).json({ 
+        error: "Token Apple non valido" 
+      });
+    }
+  });
+
+  // iOS In-App Purchase verification endpoint
+  app.post('/api/verify-purchase', async (req, res) => {
+    try {
+      const { receiptData, productId, transactionId, bookingId } = req.body;
+      
+      if (!receiptData) {
+        return res.status(400).json({ error: "Receipt mancante" });
+      }
+
+      // Verify receipt with Apple's server
+      const verifyReceipt = async (receipt: string, sandbox: boolean = false) => {
+        const url = sandbox 
+          ? 'https://sandbox.itunes.apple.com/verifyReceipt'
+          : 'https://buy.itunes.apple.com/verifyReceipt';
+        
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            'receipt-data': receipt,
+            'password': process.env.APP_STORE_SHARED_SECRET || ''
+          })
+        });
+        
+        return await response.json();
+      };
+
+      // Try production first, then sandbox
+      let result = await verifyReceipt(receiptData);
+      
+      if (result.status === 21007) {
+        // Receipt is from sandbox, retry with sandbox URL
+        result = await verifyReceipt(receiptData, true);
+      }
+
+      if (result.status === 0) {
+        // Receipt is valid
+        const receiptInfo = result.receipt;
+        const inAppPurchases = receiptInfo.in_app || [];
+        
+        // Verify the transaction matches what was requested
+        if (!productId || !transactionId) {
+          return res.status(400).json({
+            error: 'productId e transactionId sono obbligatori'
+          });
+        }
+
+        const matchingTransaction = inAppPurchases.find(
+          (purchase: any) => purchase.transaction_id === transactionId && purchase.product_id === productId
+        );
+
+        if (!matchingTransaction) {
+          return res.status(400).json({
+            error: 'Transaction non corrispondente nel receipt'
+          });
+        }
+
+        // If this is a booking payment, verify ownership and update status
+        if (bookingId && req.session?.user) {
+          try {
+            const bookingIdNum = parseInt(bookingId);
+            const appleTransactionId = matchingTransaction.original_transaction_id || transactionId;
+            
+            // GLOBAL idempotency check: verify transaction hasn't been used by ANY user
+            const existingTransactionBooking = await db
+              .select()
+              .from(bookings)
+              .where(eq(bookings.paymentTransactionId, appleTransactionId))
+              .limit(1);
+            
+            if (existingTransactionBooking.length > 0) {
+              console.warn(`⚠️ Receipt replay attempt blocked: transaction ${appleTransactionId} already used for booking ${existingTransactionBooking[0].id}`);
+              return res.status(409).json({
+                error: 'Questa transazione Apple è già stata utilizzata',
+                success: false
+              });
+            }
+            
+            // Get THIS specific booking to verify ownership and current status
+            const userBookings = await storage.getBookingsByCustomer(parseInt(req.session.user.id));
+            const booking = userBookings.find(b => b.id === bookingIdNum);
+            
+            if (!booking) {
+              return res.status(404).json({
+                error: 'Booking non trovato o non autorizzato'
+              });
+            }
+
+            // Prevent replay: check if booking is already confirmed
+            if (booking.status === 'confirmed') {
+              return res.status(400).json({
+                error: 'Booking già confermato',
+                success: false
+              });
+            }
+
+            // Update booking to confirmed WITH transaction ID
+            // Wrapped in try-catch to handle unique constraint violations (race condition protection)
+            try {
+              await db
+                .update(bookings)
+                .set({ 
+                  status: 'confirmed',
+                  paymentTransactionId: appleTransactionId,
+                  paymentProvider: 'apple',
+                  updatedAt: new Date()
+                })
+                .where(eq(bookings.id, bookingIdNum));
+
+              console.log(`✅ Booking ${bookingId} confirmed via IAP`, {
+                userId: req.session.user.id,
+                transactionId,
+                originalTransactionId: appleTransactionId,
+                productId,
+                environment: result.environment
+              });
+            } catch (dbError: any) {
+              // Handle unique constraint violation (race condition caught by DB)
+              if (dbError.code === '23505') { // PostgreSQL unique violation
+                console.warn(`⚠️ Race condition blocked: transaction ${appleTransactionId} constraint violation`);
+                return res.status(409).json({
+                  error: 'Questa transazione Apple è già stata utilizzata',
+                  success: false
+                });
+              }
+              throw dbError; // Re-throw if it's a different error
+            }
+          } catch (error) {
+            console.error(`❌ Failed to update booking ${bookingId}:`, error);
+            return res.status(500).json({
+              error: 'Errore durante l\'aggiornamento booking'
+            });
+          }
+        }
+        
+        res.json({
+          success: true,
+          environment: result.environment || 'Production',
+          receipt: {
+            bundle_id: receiptInfo.bundle_id,
+            application_version: receiptInfo.application_version,
+            original_purchase_date: receiptInfo.original_purchase_date
+          },
+          purchase: matchingTransaction || inAppPurchases[0],
+          transactionId: transactionId
+        });
+      } else {
+        // Map common Apple status codes to user-friendly messages
+        const errorMessages: Record<number, string> = {
+          21000: 'App Store non può leggere il receipt',
+          21002: 'Dati del receipt malformati',
+          21003: 'Receipt non autenticato',
+          21004: 'Shared secret non corretto',
+          21005: 'Server receipt non disponibile',
+          21006: 'Receipt valido ma subscription scaduta',
+          21007: 'Receipt da sandbox in produzione',
+          21008: 'Receipt da produzione in sandbox'
+        };
+
+        res.status(400).json({
+          error: errorMessages[result.status] || `Verifica fallita: codice ${result.status}`
+        });
+      }
+    } catch (error: any) {
+      console.error("Purchase verification error:", error);
+      res.status(500).json({ 
+        error: error.message || "Errore durante la verifica acquisto" 
+      });
+    }
+  });
+
+  // Create demo account endpoint (for Apple review)
+  app.post('/api/create-demo-account', async (req, res) => {
+    try {
+      const demoEmail = 'demo@seaboo.it';
+      const demoPassword = 'SeaBooDemo2025!';
+      
+      // Check if demo account already exists
+      const existing = await storage.getUserByEmail(demoEmail);
+      if (existing) {
+        return res.json({ 
+          success: true, 
+          message: 'Account demo già esistente',
+          credentials: { email: demoEmail, password: demoPassword }
+        });
+      }
+
+      // Create demo account
+      const demoUser = await storage.createUser({
+        email: demoEmail,
+        password: demoPassword,
+        firstName: 'Demo',
+        lastName: 'User',
+        role: 'user'
+      });
+
+      res.json({ 
+        success: true, 
+        message: 'Account demo creato',
+        credentials: { email: demoEmail, password: demoPassword },
+        user: {
+          id: demoUser.id,
+          email: demoUser.email
+        }
+      });
+    } catch (error: any) {
+      console.error("Demo account creation error:", error);
+      res.status(500).json({ 
+        error: error.message || "Errore durante la creazione account demo" 
+      });
     }
   });
 

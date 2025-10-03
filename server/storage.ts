@@ -38,6 +38,7 @@ export interface IStorage {
   getBookingsByOwner(ownerId: number): Promise<Booking[]>;
   getBookingsByCustomer(customerId: number): Promise<Booking[]>;
   createBooking(booking: InsertBooking): Promise<Booking>;
+  updateBookingStatus(id: number, status: string): Promise<Booking | undefined>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -66,8 +67,12 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createUser(userData: InsertUser): Promise<User> {
-    // Hash password before storing
-    const hashedPassword = await bcrypt.hash(userData.password, 12);
+    // Hash password before storing if not already hashed
+    // Check if password is already hashed (bcrypt hashes start with $2a$, $2b$, or $2y$)
+    const isAlreadyHashed = /^\$2[aby]\$/.test(userData.password);
+    const hashedPassword = isAlreadyHashed 
+      ? userData.password 
+      : await bcrypt.hash(userData.password, 12);
     
     // Generate username from email if not provided
     const username = userData.username || userData.email.split('@')[0];
@@ -153,6 +158,15 @@ export class DatabaseStorage implements IStorage {
 
   async createBooking(bookingData: InsertBooking): Promise<Booking> {
     const [booking] = await db.insert(bookings).values(bookingData).returning();
+    return booking;
+  }
+
+  async updateBookingStatus(id: number, status: string): Promise<Booking | undefined> {
+    const [booking] = await db
+      .update(bookings)
+      .set({ status, updatedAt: new Date() })
+      .where(eq(bookings.id, id))
+      .returning();
     return booking;
   }
 }
