@@ -122,7 +122,7 @@ export function Header() {
                   <Button variant="ghost" size="sm" className="flex items-center gap-2">
                     <Avatar className="h-8 w-8">
                       <AvatarFallback className="bg-blue-100 text-blue-600">
-                        {user.firstName?.[0] || user.username?.[0] || "U"}
+                        {user.firstName?.[0] || user.email?.[0]?.toUpperCase() || "U"}
                       </AvatarFallback>
                     </Avatar>
                   </Button>
