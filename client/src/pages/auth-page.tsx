@@ -9,6 +9,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Anchor } from "lucide-react";
+import { signInWithApple } from "@/lib/apple-signin";
 
 export function AuthPage() {
   const [, setLocation] = useLocation();
@@ -96,6 +97,33 @@ export function AuthPage() {
     });
   };
 
+  const handleAppleSignIn = async () => {
+    try {
+      const result = await signInWithApple();
+      
+      if (result.success && result.user) {
+        queryClient.invalidateQueries({ queryKey: ["/api/user"] });
+        toast({
+          title: "Login effettuato!",
+          description: `Benvenuto ${result.user.firstName || result.user.email}!`,
+        });
+        setLocation("/");
+      } else {
+        toast({
+          variant: "destructive",
+          title: "Errore",
+          description: result.error || "Errore durante l'autenticazione con Apple",
+        });
+      }
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "Errore",
+        description: error.message || "Errore durante l'autenticazione con Apple",
+      });
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-blue-100 flex items-center justify-center p-4">
       <Card className="w-full max-w-md">
@@ -121,12 +149,7 @@ export function AuthPage() {
                   type="button"
                   variant="outline"
                   className="w-full bg-black text-white hover:bg-gray-800 hover:text-white border-black"
-                  onClick={() => {
-                    toast({
-                      title: "Apple Sign In",
-                      description: "Funzionalità disponibile solo su iOS. Backend già implementato e sicuro.",
-                    });
-                  }}
+                  onClick={handleAppleSignIn}
                   data-testid="button-apple-signin"
                 >
                   <svg className="w-5 h-5 mr-2" viewBox="0 0 24 24" fill="currentColor">
